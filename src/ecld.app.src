@@ -5,7 +5,8 @@
   {mod, {'ecld_app', []}},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    ecl
    ]},
   {env,[]},
   {modules, []},
