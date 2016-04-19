@@ -22,7 +22,7 @@
 -define(p(Str), list_to_binary(io_lib:format("Mod:~w line:~w ~100P~n", [?MODULE,?LINE, Str, 300]))).
 
 
--define(DCS_SUP, ecld_cs_sup).
+-define(DCS_SUP, ecld_sup).
 -define(DC_SUP,  ecld_c_sup).
 -define(DMS_SUP, ecld_ms_sup).
 -define(WORKER,  ecld_worker).
