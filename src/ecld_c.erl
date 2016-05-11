@@ -16,7 +16,6 @@
          code_change/3]).
 
 -export([start_domain/2, stop_domain/1]).
--export([get_pid/3]).
 
 %% Print message with module and line number point
 -define(p(Str), list_to_binary(io_lib:format("Mod:~w line:~w ~100P~n", [?MODULE,?LINE, Str, 300]))).
@@ -34,13 +33,13 @@ start_domain(Name, WorkerChildSpec) ->
   %% 1. start domain controller supervisor (dc_sup)
   DcSupName = list_to_atom(atom_to_list(Name) ++ "_c_sup"),
   DcSupChildSpec = mk_ch_sp_domain(?DC_SUP, DcSupName, supervisor, permanent, [DcSupName]),
-  {ok, DcSupPid} = supervisor:start_child(?DCS_SUP, DcSupChildSpec),
+  {ok, _DcSupPid} = supervisor:start_child(?DCS_SUP, DcSupChildSpec),
   %% 2. start domain members supervisor (dms_sup)
   DmsSupName = list_to_atom(atom_to_list(Name) ++ "_ms_sup"),
   DmsSupChildSpec = mk_ch_sp_domain(?DMS_SUP, DmsSupName, supervisor, permanent, [DmsSupName]),
-  {ok, DmsSupPid} = supervisor:start_child(DcSupName, DmsSupChildSpec),
+  {ok, _DmsSupPid} = supervisor:start_child(DcSupName, DmsSupChildSpec),
   %% 3. start domain controler server (dc)
-  DCArgs = [Name, DcSupPid, DmsSupPid, WorkerChildSpec],
+  DCArgs = [Name, DcSupName, DmsSupName, WorkerChildSpec],
   DcChildSpec = mk_ch_sp_domain(?MODULE, Name, worker, permanent, [DCArgs]),
   {ok, _DcPid} = supervisor:start_child(DcSupName, DcChildSpec),
   ok.
@@ -61,15 +60,19 @@ code_change(_OldVersion, State, _Extra) -> {ok, State}.
 terminate(_Reason, _State) -> ok.
 
 %%casts
-handle_cast({run, _FunName, Fun, Args}, State) -> apply(Fun, [State|Args]);
+handle_cast({run, _FunName, Fun, Args}, State)             -> apply(Fun, [State|Args]);
+handle_cast({reply, {Id, Ref, Reply}}, State)       -> reply_(State, Id, Ref, Reply);
 handle_cast(_Req, State) -> {noreply, State}.
 %%calls
-handle_call({run, _FunName, Fun, Args}, From, State) -> apply(Fun, [State,From|Args]);
-handle_call(ping, _From, State) -> {reply, pong, State};
+handle_call({run, _FunName, Fun, Args}, From, State)       -> apply(Fun, [State,From|Args]);
+handle_call(ping, _From, State)                            -> {reply, pong, State};
 %% domain modes
-handle_call({norma, Domain,  Id, Options}, _From, State) -> norma_(State, Domain,  Id, Options);
-handle_call({proxy, Domains, Id, Options}, _From, State) -> proxy_(State, Domains, Id, Options);
-handle_call({merge, Domains, Id, Options}, _From, State) -> merge_(State, Domains, Id, Options);
+handle_call(flush, _From, State)                           -> flush_(State);
+handle_call({flush_queue, Id}, _From, State)               -> flush_queue_(State, Id);
+handle_call({norma, _Domain, Id, Options}, From, State)    -> recv_(State, From, norma,  Id, Options);
+handle_call({proxy, Domains, Id, Options}, From, State)    -> recv_(State, From, {proxy, Domains}, Id, Options);
+handle_call({merge, Domains, Id, Options}, From, State)    -> recv_(State, From, {merge, Domains}, Id, Options);
+handle_call({start_with_state, Id, IdState}, _From, State) -> start_with_state_(State, Id, IdState);
 %%
 handle_call(_Req, _From, State) -> {reply, unknown_command, State}.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -77,34 +80,21 @@ handle_call(_Req, _From, State) -> {reply, unknown_command, State}.
 
 
 init([Name, DcSupPid, DmsSupPid, WorkerChildSpec]) -> 
-  S = #{name => Name, qs => [], dc_sup => DcSupPid, dms_sup => DmsSupPid, child => WorkerChildSpec},
+  S = #{mode    => non_blocking, %% TODO blocking|non_blocking
+        name    => Name, 
+        qs      => qdict:new(), 
+        dc_sup  => DcSupPid, 
+        dms_sup => DmsSupPid, 
+        child   => WorkerChildSpec},
   {ok, S}.
 
 
+flush_(S) ->
+  {reply, ok, S#{qs := dict:new()}}.
+  
+flush_queue_(S = #{qs := QS}, Id) ->
+  {reply, ok, S#{qs := dict:erase(Id, QS)}}.
 
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% API
--type answer()   :: {ok, pid()}|not_started|not_exists|{err, {atom(), binary()}}.
-
-
-%%
-%% Options = #{
-%%    start => true, %% Start process if not exists
-%%    init  => true  %% Init profile if not exists in database
-%% }. 
-%%  
--spec get_pid(atom(), binary(), map()) -> answer().
-get_pid(Cluster, Id, Options) ->
-  case ecl:get(Cluster, Id) of
-    {ok, {Status, [D]}} when Status == norma -> 
-      #{node := Node, name := Name} = D,
-      gen_server:call({Name,Node}, {Status, D, Id, Options});
-    {ok, {Status, Ds = [ND, _OD] }} when Status == proxy; Status == merge -> 
-      #{node := Node, name := Name} = ND,
-      gen_server:call({Name, Node}, {Status, Ds, Id, Options});
-    Else -> Else
-  end.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -116,79 +106,179 @@ get_pid(Cluster, Id, Options) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-%% Just normal
-norma_(S = #{dms_sup := Sup, child := TplChild = #{start := {M,F,A}}}, _Domain, Id, Options) ->
-  Child = TplChild#{id => Id, start := {M,F,[Options|A]}},
-  mk_ch_sp(?WORKER, Id, worker, temporary, Options),
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Non blocking receive
+%% recv_(S, Mode, Id, Options) -> {noreply, NewS}. {{{
+recv_(S = #{dms_sup := Sup, child := TplChild, qs := QS}, From, Mode, Id, Options) ->
+  Ref = erlang:make_ref(),
+  QMember = #{
+      from      => From, 
+      mode      => Mode, 
+      sup       => Sup, 
+      child_sp  => TplChild, 
+      opts      => Options},
+
+  {NewQS, QSize} = qdict:in_l(Id, {Ref, QMember}, QS),
+
+  % send to request if first in queue
+  case QSize == 1 of 
+    true  -> req(Id, Ref, QMember);
+    false -> do_nothing
+  end,
+
+  {noreply, S#{qs := NewQS}}.
+%%}}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Non blocking reply
+%% reply_(S = #{qs := QS}, Id, Ref, Reply) -> {noreply, NewS}. {{{
+reply_(S = #{qs := QS}, Id, Ref, Reply) ->
+  case qdict:out2(Id, QS) of
+    {{value, {Ref1, #{from := From} }}, empty, NewQS} when Ref1 == Ref ->
+        gen_server:reply(From, Reply),
+        {noreply, S#{qs := NewQS}};
+    {{value, {Ref1, #{from := From} }}, {value, {Ref2, QMember2}}, NewQS} when Ref1 == Ref -> 
+        gen_server:reply(From, Reply),
+        req(Id, Ref2, QMember2),
+        {noreply, S#{qs := NewQS}};
+    _ ->
+        {noreply, S}
+  end.
+%% }}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  
+
+%
+req(Id, Ref, #{mode := norma, sup := Sup, child_sp := TplChild, opts := Options}) ->
+  Self = self(),
+  spawn(fun() -> norma_spawn(Self, Sup, Id, Ref, Options, TplChild) end);
+%
+req(Id, Ref, #{mode := {proxy, [_ND, OD]}, sup := Sup, child_sp := TplChild, opts := Options}) ->
+  Self = self(),
+  spawn(fun() -> proxy_spawn(Self, OD, Sup, Id, Ref, Options, TplChild) end);
+%
+req(Id, Ref, #{mode := {merge, [_ND, OD]}, sup := Sup, child_sp := TplChild, opts := Options}) ->
+  Self = self(),
+  spawn(fun() -> merge_spawn(Self, OD, Sup, Id, Ref, Options, TplChild) end).
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% blocking starting for migrate
+%% start_with_state_(S, Id, IdState) {{{
+start_with_state_(S = #{dms_sup := Sup, child := TplChild = #{start := {M,F,A}} }, Id, IdState) ->
+  Child = TplChild#{id => Id, start := {M,F,[#{state => IdState}|A]}},
+  Reply =
+    case supervisor:start_child(Sup, Child) of
+      {ok, Pid}                       -> {ok, Pid};
+      Else                            -> {err, {start_or_lookup_failure, Else}}
+    end,
+  {reply, Reply, S}.
+%%}}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%% SPAWNS
+
+% Just norma
+%% norma_spawn(DcPid, Sup, Id, Ref, Options, TplChild = #{start := {M,F,A}}) {{{ 
+norma_spawn(DcPid, Sup, Id, Ref, Options, TplChild = #{start := {M,F,A}}) ->
+  Child = TplChild#{id => Id, start := {M,F,[Options#{id => Id}|A]}},
   Reply =
     case supervisor:start_child(Sup, Child) of
       {error, {already_started, Pid}} -> {ok, Pid};
+      {ok, Pid}                       -> {ok, Pid};
       {error, {not_started,     _}}   -> not_started; %% If Type == lookup_process
       {error, {not_exists,      _}}   -> not_exists;  %% If Type == lookup_process
       Else                            -> {err, {start_or_lookup_failure, Else}}
     end,
-  {reply, Reply, S}.
+  gen_server:cast(DcPid, {reply, {Id, Ref, Reply}}).
+%%}}}
 
 
-%% Just proxy
-proxy_(S, [_NewDomain, OldDomain], Id, Options) ->
-  #{node := Node, name := Name} = OldDomain,
-  Reply = gen_server:call({Name,Node}, {norma, OldDomain, Id, Options}),
-  {reply, Reply, S}.
-    
+% Proxy mode
+% 1. Check on new domain
+%   1.1. If true return pid
+% 2. Proxy to old domain in norma mode
+%% proxy_spawn(DcPid, OD, Sup, Id, Ref, Options, TplChild = #{start := {M,F,A}}) {{{
+proxy_spawn(DcPid, OD, Sup, Id, Ref, Options, TplChild = #{start := {M,F,A}}) ->
+  ProxyOptions = #{start => false, init => false},
+  ProxyChild = TplChild#{id => Id, start := {M,F,[ProxyOptions|A]}},
+  Reply =
+    case supervisor:start_child(Sup, ProxyChild) of
+      {error, {already_started, Pid}} -> {ok, Pid};
+      {ok, Pid}                       -> {ok, Pid};
+      {error, {not_started,     _}}   -> 
+        #{node := Node, name := Name} = OD,  
+        gen_server:call({Name,Node}, {norma, OD, Id, Options});
+      Else -> {err, {start_or_lookup_failure, Else}}
+    end,
+  gen_server:cast(DcPid, {reply, {Id, Ref, Reply}}).
+%% }}}
 
 
-%%
+% Merge mode
 % 1. Check on new domain
 %   1.1. If true return pid
 % 2. Check on old domain
 %   2.1. If true, do migrate and return pid
 % 3. Start on new domain
-merge_(S = #{dms_sup := Sup, child := TplChild = #{start := {M,F,A}}}, _Ds = [_ND, OD], Id, Options) -> 
-
-  Child = fun(OptValue) -> TplChild#{id => Id, start := {M,F,[OptValue|A]}} end,
-
-  OptionsLookUp = #{start => false, init => false},
-
+%% merge_spawn(DcPid, OD, Sup, Id, Ref, Options, TplChild = #{start := {M,F,A}}) {{{
+merge_spawn(DcPid, OD, Sup, Id, Ref, Options, TplChild = #{start := {M,F,A}}) ->
+  MergeOptions = #{start => false, init => false},
+  MergeChild = TplChild#{id => Id, start := {M,F,[MergeOptions|A]}},
   Reply =
-    case supervisor:start_child(Sup, Child(OptionsLookUp)) of
+    case supervisor:start_child(Sup, MergeChild) of
       {error, {already_started, Pid}} -> {ok, Pid};
-      {error, {not_started, _}} -> 
+      {error, {not_started,     _}}   ->
         #{node := Node, name := Name} = OD,
-        case gen_server:call({Name, Node}, {norma, OD, Id, OptionsLookUp}) of
-          {ok, Pid}   -> %% migrate;
-            %% TODO Migrate function: NewPid = migrate(Pid, ND).
-            {ok, Pid};
-          not_started -> 
-            case Options of
-              #{start := true} -> 
-                  case supervisor:start_child(Sup, Child(Options)) of
-                    {ok, Pid}                 -> {ok, Pid};
-                    {error, {not_exists,  _}} -> not_exists;
-                    Else                      -> {err, {lookup_failure, Else}}
-                  end;
-              _ -> not_started
-            end 
+        case gen_server:call({Name, Node}, {norma, OD, Id, Options}) of
+          {ok, Pid} -> do_migrate(Id, Pid, DcPid); %% do_migrate
+          not_started ->
+            Child = TplChild#{id => Id, start := {M,F,[Options|A]}},
+            case supervisor:start_child(Sup, Child) of
+              {error, {already_started, Pid}} -> {ok, Pid};
+              {ok, Pid}                       -> {ok, Pid};
+              {error, {not_started,     _}}   -> not_started; %% If Type == lookup_process
+              {error, {not_exists,      _}}   -> not_exists;  %% If Type == lookup_process
+              Else                            -> {err, {start_or_lookup_failure, Else}}
+            end;
+          Else -> {err, {start_or_lookup_failure, Else}}
         end;
       Else -> {err, {start_or_lookup_failure, Else}}
     end,
+  gen_server:cast(DcPid, {reply, {Id, Ref, Reply}}).
 
-  {reply, Reply, S}.
-  
+%%
+do_migrate(Id, Pid, DcPid) -> 
+  %% 1. Take a State
+  {ok, State} = gen_server:call(Pid, get_state),
+  %% 2. Start with state in sync mode
+  {ok, NewPid} = gen_server:call(DcPid, {start_with_state, Id, State}),
+  %% 3. Stop old
+  gen_server:call(Pid, stop_due_migrate),
+  {ok, NewPid}.
+%%}}}
+
 
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% MISC
-mk_ch_sp(Module, Name, Type, Restart, Args) ->
-  #{id        => Name,
-    start     => {Module, start_link, Args#{id => Name}},
-    restart   => Restart,
-    shutdown  => 5000,
-    type      => Type,
-    modules   => [Module]}.
+%mk_ch_sp(Module, Name, Type, Restart, Args) ->
+%  #{id        => Name,
+%    start     => {Module, start_link, Args#{id => Name}},
+%    restart   => Restart,
+%    shutdown  => 5000,
+%    type      => Type,
+%    modules   => [Module]}.
 
-
+%
 mk_ch_sp_domain(Module, Name, Type, Restart, Args) ->
   #{id        => Name,
     start     => {Module, start_link, Args},

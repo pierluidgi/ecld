@@ -1,9 +1,10 @@
 ecld
 =====
 
-An OTP application
+Ecld - Erlang cluster domains app
 
-Build
+
+Usage
 -----
-
-    $ rebar3 compile
+see example\_ecld
+    
