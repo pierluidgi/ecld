@@ -4,6 +4,10 @@
 -export([get_pid/3, call/4, cast/4]).
 
 
+%% For debug only!!!
+-export([list/1]). 
+
+
 
 -type answer() :: {ok, pid()}|not_started|not_exists|{err, {atom(), binary()}}.
 %%
@@ -39,3 +43,25 @@ cast(Cluster, Id, Msg, Options) ->
     Else -> Else
   end.
 
+
+
+%%For debug only!!!
+list(Cluster) ->
+  case ecl:show(Cluster) of
+    {ok,#{domains := Domains}} ->
+      GetWorkersFun = fun
+        (Fu, [{_, #{node := Node, name := Name}}|Dms], Acc = #{workers := Ws, errors := Errs}) -> 
+            DomainMembersSupName = list_to_atom(atom_to_list(Name) ++ "_ms_sup"),
+            case rpc:call(Node, supervisor, which_children, [DomainMembersSupName]) of
+              List when is_list(List) -> Fu(Fu, Dms, Acc#{workers := [List|Ws]});
+              _Else -> Fu(Fu, Dms, Acc#{errors := Errs + 1})
+            end;
+        (Fu, [_|Dms], Acc = #{errors := Errs}) ->
+            Fu(Fu, Dms, Acc#{errors := Errs + 1});
+        (_F, [], Acc = #{workers := Ws}) ->
+            NewWs = lists:reverse(lists:flatten(Ws)),
+            Acc#{workers := NewWs} 
+      end,
+      GetWorkersFun(GetWorkersFun, Domains, #{workers => [], errors => 0});
+    Else -> Else
+  end.
