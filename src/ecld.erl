@@ -5,7 +5,7 @@
 
 
 %% For debug only!!!
--export([list/1]). 
+-export([list/1, list_all/1, len/1, len_all/1]). 
 
 
 
@@ -47,10 +47,12 @@ cast(Cluster, Id, Msg, Options) ->
 
 %%For debug only!!!
 list(Cluster) ->
+  CurNode = node(),
   case ecl:show(Cluster) of
     {ok,#{domains := Domains}} ->
       GetWorkersFun = fun
-        (Fu, [{_, #{node := Node, name := Name}}|Dms], Acc = #{workers := Ws, errors := Errs}) -> 
+        (Fu, [{_, #{node := Node, name := Name}}|Dms], Acc = #{workers := Ws, 
+                                                               errors := Errs}) when Node == CurNode -> 
             DomainMembersSupName = list_to_atom(atom_to_list(Name) ++ "_ms_sup"),
             case rpc:call(Node, supervisor, which_children, [DomainMembersSupName]) of
               List when is_list(List) -> Fu(Fu, Dms, Acc#{workers := [List|Ws]});
@@ -60,8 +62,47 @@ list(Cluster) ->
             Fu(Fu, Dms, Acc#{errors := Errs + 1});
         (_F, [], Acc = #{workers := Ws}) ->
             NewWs = lists:reverse(lists:flatten(Ws)),
-            Acc#{workers := NewWs} 
+            {ok, Acc#{workers := NewWs}} 
       end,
       GetWorkersFun(GetWorkersFun, Domains, #{workers => [], errors => 0});
+    Else -> Else
+  end.
+
+%
+list_all(Cluster) ->
+  case ecl:show(Cluster) of
+    {ok,#{domains := Domains}} ->
+      GetWorkersFun = fun
+        (Fu, [{_, #{node := Node, name := Name}}|Dms], Acc = #{workers := Ws, 
+                                                               errors  := Errs,
+                                                               nodes   := Nodes}) -> 
+            DomainMembersSupName = list_to_atom(atom_to_list(Name) ++ "_ms_sup"),
+            NewNodes = lists:usort([Node|Nodes]),
+            case rpc:call(Node, supervisor, which_children, [DomainMembersSupName]) of
+              List when is_list(List) -> 
+                Fu(Fu, Dms, Acc#{workers := [List|Ws], nodes := NewNodes});
+              _Else -> 
+                Fu(Fu, Dms, Acc#{errors := Errs + 1, nodes := NewNodes})
+            end;
+        (Fu, [_|Dms], Acc = #{errors := Errs}) ->
+            Fu(Fu, Dms, Acc#{errors := Errs + 1});
+        (_F, [], Acc = #{workers := Ws}) ->
+            NewWs = lists:reverse(lists:flatten(Ws)),
+            {ok, Acc#{workers := NewWs}} 
+      end,
+      GetWorkersFun(GetWorkersFun, Domains, #{workers => [], errors => 0, nodes => []});
+    Else -> Else
+  end.
+
+%
+len(Cluster) ->
+  case list(Cluster) of
+    {ok, #{workers := Ws}} -> {ok, length(Ws)};
+    Else -> Else
+  end.
+
+len_all(Cluster) ->
+  case list_all(Cluster) of
+    {ok, #{workers := Ws}} -> {ok, length(Ws)};
     Else -> Else
   end.
