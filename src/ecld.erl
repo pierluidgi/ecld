@@ -3,6 +3,7 @@
 
 -export([get_pid/3, call/4, cast/4]).
 
+-export([stop_cluster_by_domains_prefix/1]).
 
 %% For debug only!!!
 -export([list/1, list_all/1, len/1, len_all/1]). 
@@ -16,6 +17,30 @@
 %%    init  => true  %% Init profile if not exists in database
 %% }. 
 %%  
+
+
+-spec stop_cluster_by_domains_prefix(atom()) -> ok.
+stop_cluster_by_domains_prefix(ClusterPrefix) when is_atom(ClusterPrefix) ->
+  Prefix = atom_to_binary(ClusterPrefix, latin1),
+  Len = size(Prefix),
+  Sups = supervisor:which_children(ecld_sup),
+  
+  IsPrefix = fun(SName) -> 
+    case atom_to_binary(SName, latin1) of 
+      <<Prefix:Len/binary, _/binary>> -> true; 
+      _ -> false 
+    end 
+  end,
+
+  StopDomain = fun(SName) ->
+    supervisor:terminate_child(ecld_sup, SName),
+    supervisor:delete_child(ecld_sup, SName)
+  end,
+
+  [StopDomain(SName) || {SName, _, _,_} <- Sups, IsPrefix(SName)],
+  ok;
+stop_cluster_by_domains_prefix(_Clister) -> {err, wrong_claster_name}.
+
 
 -spec get_pid(atom(), binary(), map()) -> answer().
 get_pid(Cluster, Id, Options) ->
