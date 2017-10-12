@@ -1,7 +1,7 @@
 
 -module(ecld).
 
--export([get_pid/3, call/4, cast/4]).
+-export([get_pid/3, call/4, call/5, cast/4]).
 
 -export([stop_cluster_by_domains_prefix/1]).
 
@@ -58,6 +58,12 @@ get_pid(Cluster, Id, Options) ->
 call(Cluster, Id, Msg, Options) -> 
   case get_pid(Cluster, Id, Options) of
     {ok, Pid} -> gen_server:call(Pid, Msg);
+    Else -> Else
+  end.
+
+call(Cluster, Id, Msg, Options, Timeout) -> 
+  case get_pid(Cluster, Id, Options) of
+    {ok, Pid} -> gen_server:call(Pid, Msg, Timeout);
     Else -> Else
   end.
 
